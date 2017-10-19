@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -75,6 +76,7 @@ func authenticate(w http.ResponseWriter, r *http.Request) error {
 func initializeHandler(w http.ResponseWriter, r *http.Request) {
 	_, err := db.Exec(`DELETE FROM entry WHERE id > 7101`)
 	panicIf(err)
+	initializeRepalcer()
 
 	resp, err := http.Get(fmt.Sprintf("%s/initialize", isutarEndpoint))
 	panicIf(err)
@@ -173,6 +175,9 @@ func keywordPostHandler(w http.ResponseWriter, r *http.Request) {
 		author_id = ?, keyword = ?, description = ?, updated_at = NOW()
 	`, userID, keyword, description, userID, keyword, description)
 	panicIf(err)
+	u, err := r.URL.Parse(baseUrl.String() + "/keyword/" + pathURIEscape(keyword))
+	panicIf(err)
+	AddKeyword(keyword, fmt.Sprintf("<a href=\"%s\">%s</a>", u, html.EscapeString(keyword)))
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
@@ -308,66 +313,96 @@ func keywordByKeywordDeleteHandler(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
+type Keyword struct {
+	Key  string
+	hash string
+	Link string
+}
+
+type Keywords []*Keyword
+
+func (ks Keywords) Len() int           { return len(ks) }
+func (ks Keywords) Swap(i, j int)      { ks[i], ks[j] = ks[j], ks[i] }
+func (ks Keywords) Less(i, j int) bool { return len(ks[i].Key) < len(ks[j].Key) }
+
 var (
 	htmlifyRe        *regexp.Regexp
 	htmlifyCacheTime time.Time
 	htmlifyCacheMu   sync.Mutex
 	htmlifyReMu      sync.RWMutex
+
+	kwControlMu sync.Mutex
+	keywords    Keywords
+
+	kwReplacerMu                 sync.RWMutex
+	kw1stReplacer, kw2ndReplacer *strings.Replacer
 )
 
-func createCache() {
-	now := time.Now()
-	htmlifyCacheMu.Lock()
-	defer htmlifyCacheMu.Unlock()
-
-	if now.Before(htmlifyCacheTime) {
-		return
-	}
-
+func initializeRepalcer() {
 	htmlifyCacheTime = time.Now()
 	rows, err := db.Query(`
-		SELECT * FROM entry ORDER BY CHARACTER_LENGTH(keyword) DESC
-	`)
+               SELECT keyword FROM entry
+       `)
 	panicIf(err)
-	entries := make([]*Entry, 0, 500)
 	for rows.Next() {
-		e := Entry{}
-		err := rows.Scan(&e.ID, &e.AuthorID, &e.Keyword, &e.Description, &e.UpdatedAt, &e.CreatedAt)
+		var keyword string
+		err := rows.Scan(&keyword)
 		panicIf(err)
-		entries = append(entries, &e)
+		u, err := url.Parse(baseUrl.String() + "/keyword/" + pathURIEscape(keyword))
+		panicIf(err)
+		k := &Keyword{Key: keyword, Link: fmt.Sprintf("<a href=\"%s\">%s</a>", u, html.EscapeString(keyword))}
+		keywords = append(keywords, k)
 	}
-	rows.Close()
+	sort.Sort(keywords)
+	updateRepalcer()
+}
 
-	keywords := make([]string, 0, 500)
-	for _, entry := range entries {
-		keywords = append(keywords, regexp.QuoteMeta(entry.Keyword))
+func updateRepalcer() {
+	reps1st := make([]string, 0, len(keywords)*2)
+	reps2nd := make([]string, 0, len(keywords)*2)
+	for _, k := range keywords {
+		if k.hash == "" {
+			k.hash = fmt.Sprintf("isuda_%x", sha1.Sum([]byte(k.Key)))
+		}
+		reps1st = append(reps1st, k.Key, k.hash)
+		reps2nd = append(reps2nd, k.hash, k.Link)
 	}
-	htmlifyReMu.Lock()
-	htmlifyRe = regexp.MustCompile("(" + strings.Join(keywords, "|") + ")")
-	htmlifyReMu.Unlock()
+	r1 := strings.NewReplacer(reps1st...)
+	r2 := strings.NewReplacer(reps2nd...)
+
+	kwReplacerMu.Lock()
+	kw1stReplacer = r1
+	kw2ndReplacer = r2
+	kwReplacerMu.Unlock()
+}
+
+func AddKeyword(keyword, link string) {
+	k := Keyword{Key: keyword, Link: link}
+
+	kwControlMu.Lock()
+	keywords = append(keywords, &k)
+	sort.Sort(keywords)
+
+	updateRepalcer()
+	kwControlMu.Unlock()
+}
+
+func ReplaceKeyword(c string) string {
+	kwReplacerMu.RLock()
+	r1, r2 := kw1stReplacer, kw2ndReplacer
+	kwReplacerMu.RUnlock()
+
+	x := r1.Replace(c)
+	x = html.EscapeString(x)
+	return r2.Replace(x)
 }
 
 func htmlify(w http.ResponseWriter, r *http.Request, content string) string {
 	if content == "" {
 		return ""
 	}
-	createCache()
-	htmlifyReMu.RLock()
-	defer htmlifyReMu.RUnlock()
 
-	kw2sha := make(map[string]string)
-	content = htmlifyRe.ReplaceAllStringFunc(content, func(kw string) string {
-		kw2sha[kw] = "isuda_" + fmt.Sprintf("%x", sha1.Sum([]byte(kw)))
-		return kw2sha[kw]
-	})
-	content = html.EscapeString(content)
-	for kw, hash := range kw2sha {
-		u, err := r.URL.Parse(baseUrl.String() + "/keyword/" + pathURIEscape(kw))
-		panicIf(err)
-		link := fmt.Sprintf("<a href=\"%s\">%s</a>", u, html.EscapeString(kw))
-		content = strings.Replace(content, hash, link, -1)
-	}
-	return strings.Replace(content, "\n", "<br />\n", -1)
+	return strings.Replace(ReplaceKeyword(content), "\n", "<br />\n", -1)
 }
 
 func loadStars(keyword string) []*Star {
