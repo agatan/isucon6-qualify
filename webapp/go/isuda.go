@@ -12,11 +12,14 @@ import (
 	"log"
 	"math"
 	"net/http"
+	_ "net/http/pprof"
 	"net/url"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/Songmu/strrand"
 	_ "github.com/go-sql-driver/mysql"
@@ -305,10 +308,23 @@ func keywordByKeywordDeleteHandler(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
-func htmlify(w http.ResponseWriter, r *http.Request, content string) string {
-	if content == "" {
-		return ""
+var (
+	htmlifyRe        *regexp.Regexp
+	htmlifyCacheTime time.Time
+	htmlifyCacheMu   sync.Mutex
+	htmlifyReMu      sync.RWMutex
+)
+
+func createCache() {
+	now := time.Now()
+	htmlifyCacheMu.Lock()
+	defer htmlifyCacheMu.Unlock()
+
+	if now.Before(htmlifyCacheTime) {
+		return
 	}
+
+	htmlifyCacheTime = time.Now()
 	rows, err := db.Query(`
 		SELECT * FROM entry ORDER BY CHARACTER_LENGTH(keyword) DESC
 	`)
@@ -326,9 +342,21 @@ func htmlify(w http.ResponseWriter, r *http.Request, content string) string {
 	for _, entry := range entries {
 		keywords = append(keywords, regexp.QuoteMeta(entry.Keyword))
 	}
-	re := regexp.MustCompile("(" + strings.Join(keywords, "|") + ")")
+	htmlifyReMu.Lock()
+	htmlifyRe = regexp.MustCompile("(" + strings.Join(keywords, "|") + ")")
+	htmlifyReMu.Unlock()
+}
+
+func htmlify(w http.ResponseWriter, r *http.Request, content string) string {
+	if content == "" {
+		return ""
+	}
+	createCache()
+	htmlifyReMu.RLock()
+	defer htmlifyReMu.RUnlock()
+
 	kw2sha := make(map[string]string)
-	content = re.ReplaceAllStringFunc(content, func(kw string) string {
+	content = htmlifyRe.ReplaceAllStringFunc(content, func(kw string) string {
 		kw2sha[kw] = "isuda_" + fmt.Sprintf("%x", sha1.Sum([]byte(kw)))
 		return kw2sha[kw]
 	})
@@ -480,5 +508,10 @@ func main() {
 	k.Methods("POST").HandlerFunc(myHandler(keywordByKeywordDeleteHandler))
 
 	r.PathPrefix("/").Handler(http.FileServer(http.Dir("./public/")))
+
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
+
 	log.Fatal(http.ListenAndServe(":80", r))
 }
