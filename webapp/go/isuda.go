@@ -46,6 +46,12 @@ var (
 	errInvalidUser = errors.New("Invalid User")
 )
 
+var (
+	isutarBaseURL *url.URL
+	isutarDB      *sql.DB
+	isutarRe      *render.Render
+)
+
 func setName(w http.ResponseWriter, r *http.Request) error {
 	session := getSession(w, r)
 	userID, ok := session.Values["user_id"]
@@ -74,15 +80,61 @@ func authenticate(w http.ResponseWriter, r *http.Request) error {
 }
 
 func initializeHandler(w http.ResponseWriter, r *http.Request) {
-	_, err := db.Exec(`DELETE FROM entry WHERE id > 7101`)
+	_, err := isutarDB.Exec("TRUNCATE star")
+	panicIf(err)
+	isutarRe.JSON(w, http.StatusOK, map[string]string{"result": "ok"})
+
+	_, err = db.Exec(`DELETE FROM entry WHERE id > 7101`)
 	panicIf(err)
 	initializeRepalcer()
 
-	resp, err := http.Get(fmt.Sprintf("%s/initialize", isutarEndpoint))
+	re.JSON(w, http.StatusOK, map[string]string{"result": "ok"})
+}
+
+func starsHandler(w http.ResponseWriter, r *http.Request) {
+	keyword := r.FormValue("keyword")
+	rows, err := isutarDB.Query(`SELECT * FROM star WHERE keyword = ?`, keyword)
+	if err != nil && err != sql.ErrNoRows {
+		panicIf(err)
+		return
+	}
+
+	stars := make([]Star, 0, 10)
+	for rows.Next() {
+		s := Star{}
+		err := rows.Scan(&s.ID, &s.Keyword, &s.UserName, &s.CreatedAt)
+		panicIf(err)
+		stars = append(stars, s)
+	}
+	rows.Close()
+
+	isutarRe.JSON(w, http.StatusOK, map[string][]Star{
+		"result": stars,
+	})
+}
+
+func starsPostHandler(w http.ResponseWriter, r *http.Request) {
+	keyword := r.FormValue("keyword")
+
+	origin := os.Getenv("ISUDA_ORIGIN")
+	if origin == "" {
+		origin = "http://localhost:80"
+	}
+	u, err := r.URL.Parse(fmt.Sprintf("%s/keyword/%s", origin, pathURIEscape(keyword)))
+	panicIf(err)
+	resp, err := http.Get(u.String())
 	panicIf(err)
 	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		notFound(w)
+		return
+	}
 
-	re.JSON(w, http.StatusOK, map[string]string{"result": "ok"})
+	user := r.FormValue("user")
+	_, err = isutarDB.Exec(`INSERT INTO star (keyword, user_name, created_at) VALUES (?, ?, NOW())`, keyword, user)
+	panicIf(err)
+
+	isutarRe.JSON(w, http.StatusOK, map[string]string{"result": "ok"})
 }
 
 func topHandler(w http.ResponseWriter, r *http.Request) {
@@ -453,6 +505,41 @@ func getSession(w http.ResponseWriter, r *http.Request) *sessions.Session {
 	return session
 }
 
+func initIsutar() {
+	host := os.Getenv("ISUTAR_DB_HOST")
+	if host == "" {
+		host = "localhost"
+	}
+	portstr := os.Getenv("ISUTAR_DB_PORT")
+	if portstr == "" {
+		portstr = "3306"
+	}
+	port, err := strconv.Atoi(portstr)
+	if err != nil {
+		log.Fatalf("Failed to read DB port number from an environment variable ISUTAR_DB_PORT.\nError: %s", err.Error())
+	}
+	user := os.Getenv("ISUTAR_DB_USER")
+	if user == "" {
+		user = "root"
+	}
+	password := os.Getenv("ISUTAR_DB_PASSWORD")
+	dbname := os.Getenv("ISUTAR_DB_NAME")
+	if dbname == "" {
+		dbname = "isutar"
+	}
+
+	isutarDB, err = sql.Open("mysql", fmt.Sprintf(
+		"%s:%s@tcp(%s:%d)/%s?loc=Local&parseTime=true",
+		user, password, host, port, dbname,
+	))
+	if err != nil {
+		log.Fatalf("Failed to connect to DB: %s.", err.Error())
+	}
+	isutarDB.Exec("SET SESSION sql_mode='TRADITIONAL,NO_AUTO_VALUE_ON_ZERO,ONLY_FULL_GROUP_BY'")
+	isutarDB.Exec("SET NAMES utf8mb4")
+	isutarRe = render.New(render.Options{Directory: "dummy"})
+}
+
 func main() {
 	host := os.Getenv("ISUDA_DB_HOST")
 	if host == "" {
@@ -522,12 +609,18 @@ func main() {
 		},
 	})
 
+	initIsutar()
+
 	r := mux.NewRouter()
 	r.UseEncodedPath()
 	r.HandleFunc("/", myHandler(topHandler))
 	r.HandleFunc("/initialize", myHandler(initializeHandler)).Methods("GET")
 	r.HandleFunc("/robots.txt", myHandler(robotsHandler))
 	r.HandleFunc("/keyword", myHandler(keywordPostHandler)).Methods("POST")
+
+	s := r.PathPrefix("/stars").Subrouter()
+	s.Methods("GET").HandlerFunc(myHandler(starsHandler))
+	s.Methods("POST").HandlerFunc(myHandler(starsPostHandler))
 
 	l := r.PathPrefix("/login").Subrouter()
 	l.Methods("GET").HandlerFunc(myHandler(loginHandler))
