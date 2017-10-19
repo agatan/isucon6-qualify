@@ -255,6 +255,7 @@ func keywordByKeywordHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	keyword := mux.Vars(r)["keyword"]
+	keyword, _ = url.PathUnescape(keyword)
 	row := db.QueryRow(`SELECT * FROM entry WHERE keyword = ?`, keyword)
 	e := Entry{}
 	err := row.Scan(&e.ID, &e.AuthorID, &e.Keyword, &e.Description, &e.UpdatedAt, &e.CreatedAt)
@@ -325,7 +326,7 @@ func htmlify(w http.ResponseWriter, r *http.Request, content string) string {
 	for _, entry := range entries {
 		keywords = append(keywords, regexp.QuoteMeta(entry.Keyword))
 	}
-	re := regexp.MustCompile("("+strings.Join(keywords, "|")+")")
+	re := regexp.MustCompile("(" + strings.Join(keywords, "|") + ")")
 	kw2sha := make(map[string]string)
 	content = re.ReplaceAllStringFunc(content, func(kw string) string {
 		kw2sha[kw] = "isuda_" + fmt.Sprintf("%x", sha1.Sum([]byte(kw)))
@@ -333,7 +334,7 @@ func htmlify(w http.ResponseWriter, r *http.Request, content string) string {
 	})
 	content = html.EscapeString(content)
 	for kw, hash := range kw2sha {
-		u, err := r.URL.Parse(baseUrl.String()+"/keyword/" + pathURIEscape(kw))
+		u, err := r.URL.Parse(baseUrl.String() + "/keyword/" + pathURIEscape(kw))
 		panicIf(err)
 		link := fmt.Sprintf("<a href=\"%s\">%s</a>", u, html.EscapeString(kw))
 		content = strings.Replace(content, hash, link, -1)
@@ -419,6 +420,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to connect to DB: %s.", err.Error())
 	}
+	if err := db.Ping(); err != nil {
+		panic(err)
+	}
 	db.Exec("SET SESSION sql_mode='TRADITIONAL,NO_AUTO_VALUE_ON_ZERO,ONLY_FULL_GROUP_BY'")
 	db.Exec("SET NAMES utf8mb4")
 
@@ -476,5 +480,5 @@ func main() {
 	k.Methods("POST").HandlerFunc(myHandler(keywordByKeywordDeleteHandler))
 
 	r.PathPrefix("/").Handler(http.FileServer(http.Dir("./public/")))
-	log.Fatal(http.ListenAndServe(":5000", r))
+	log.Fatal(http.ListenAndServe(":80", r))
 }
